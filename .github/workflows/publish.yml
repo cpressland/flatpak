@@ -1,0 +1,75 @@
+# Publish flatpak.cpressland.io: each app in apps.json, from the Flatpak
+# builds its repository attaches to its `flatpak` release (flatpak-ARCH.tar,
+# an OSTree repository each), signed and deployed to GitHub Pages.
+#
+# A game's CI runs this when it has a new build (gh workflow run publish
+# --repo cpressland/flatpak, with a token that may); it also runs each day,
+# on a change here, and by hand.
+#
+# Needs the FLATPAK_GPG_PRIVATE_KEY secret (its public half is
+# flatpak-signing-key.asc) and Pages set to deploy from Actions.
+name: publish
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+  push:
+    branches: [main]
+    paths: ["apps.json", "publish.sh", ".github/workflows/publish.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: flatpak and ostree
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq flatpak ostree jq
+
+      - name: Each app's builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repos=()
+          for repo in $(jq -r '.[].repo' apps.json | sort -u); do
+            d="$RUNNER_TEMP/in/${repo//\//_}"
+            if ! gh release download flatpak --repo "$repo" --pattern 'flatpak-*.tar' --dir "$d"; then
+              echo "::warning::$repo has no flatpak release yet"
+              continue
+            fi
+            for t in "$d"/flatpak-*.tar; do
+              x="${t%.tar}"; mkdir -p "$x"; tar -C "$x" -xf "$t"; repos+=("$x/repo")
+            done
+          done
+          printf '%s\n' "${repos[@]}" > "$RUNNER_TEMP/repos"
+
+      - name: Sign and make the site
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_URL: ${{ vars.FLATPAK_URL || 'https://flatpak.cpressland.io' }}
+        run: |
+          mapfile -t repos < "$RUNNER_TEMP/repos"
+          ./publish.sh "$RUNNER_TEMP/site" "${repos[@]}"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
